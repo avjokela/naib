@@ -2,7 +2,6 @@ package main
 
 import (
 	"io/ioutil"
-
 	"github.com/lahemi/stack"
 )
 
@@ -14,9 +13,9 @@ func loadStartUpConfig(file string) map[string]stack.Stack {
 
 	// States
 	const (
-		RD = iota
-		COMP
-		CMT
+		RD = iota   // Read
+		COMP        // Compile
+		CMT         // Comment
 	)
 	var (
 		buf    string
