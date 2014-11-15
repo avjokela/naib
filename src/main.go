@@ -3,15 +3,15 @@ package main
 import (
 	"bufio"
 	"database/sql"
-	"io"
 	"net"
-	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/lahemi/stack"
 )
 
 var (
@@ -22,7 +22,6 @@ var (
 	)
 	titlerex = regexp.MustCompile(`(?i:<title>(.*)</title>)`)
 
-	cmdPrefix         = "˙"
 	interactCmdPrefix = "("
 
 	dataDir = os.Getenv("HOME") + "/.crude"
@@ -38,6 +37,7 @@ var (
 	nick           string
 	server         string
 	port           string
+	cmdPrefix      string
 	channelsToJoin []string
 )
 
@@ -47,6 +47,12 @@ func sendToCan(can, line string) {
 
 type MsgLine struct {
 	Nick, Cmd, Target, Msg string
+}
+
+type DBFields struct {
+	url, title string
+	timestamp  int64
+	category   string
 }
 
 func splitMsgLine(l string) MsgLine {
@@ -66,45 +72,6 @@ func handleOut(s string) {
 		stdout(ml.Nick + sep + ml.Target + sep + ml.Msg)
 	} else {
 		stdout(s)
-	}
-}
-
-func fetchTitle(msgWord string) string {
-	resp, err := http.Get(msgWord)
-	if err != nil {
-		stderr("Nope at GETing " + msgWord)
-		return ""
-	}
-	val := resp.Header.Get("Content-Type")
-	if val == "" || !strings.Contains(val, "text/html") {
-		return ""
-	}
-	var buf string
-	reader := bufio.NewReader(resp.Body)
-	for {
-		word, err := reader.ReadBytes(' ')
-		if err != nil {
-			stderr("Nope at reading the site " + string(word))
-			return ""
-		}
-		if err == io.EOF {
-			break
-		}
-		buf += string(word)
-		if m, _ := regexp.MatchString(".*(?i:</title>).*?", string(word)); m {
-			break
-		}
-		if len(buf) > 8192 {
-			break
-		}
-	}
-	titleMatch := titlerex.FindStringSubmatch(buf)
-	if len(titleMatch) == 2 {
-		stdout(len(buf))
-		return titleMatch[1]
-	} else {
-		stdout("No title found")
-		return ""
 	}
 }
 
@@ -156,9 +123,6 @@ func handleBotCmds(s string) {
 			}
 		}
 	default:
-		if !fetchTitleState {
-			return
-		}
 		if !strings.Contains(ml.Msg, "http") {
 			return
 		}
@@ -166,9 +130,14 @@ func handleBotCmds(s string) {
 			if !urlrex.MatchString(w) {
 				continue
 			}
-			if title := fetchTitle(w); title != "" {
+			title := fetchTitle(w)
+			if title != "" {
+				if !fetchTitleState {
+					continue
+				}
 				sendToCan(ml.Target, title)
 			}
+			saveLinksToDB(DBFields{url: w, title: title})
 		}
 	}
 }
@@ -180,7 +149,7 @@ func handleInteractiveCmds(cmdline string) {
 
 func init() {
 	if fi, err := os.Stat(dataDir); err != nil {
-		if err := os.Mkdir(dataDir, 0777); err != nil {
+		if err := os.MkdirAll(dataDir, 0777); err != nil {
 			die("Unable to create " + dataDir)
 		}
 		stdout("Initialization, data|config dir " + dataDir + " created.")
@@ -197,24 +166,39 @@ func init() {
 
 	if fi, err := os.Stat(startUpConfigFile); err == nil && fi.Mode().IsRegular() {
 		configs := loadStartUpConfig(startUpConfigFile)
-		n := configs["nick"]
-		s := configs["server"]
-		p := configs["port"]
-		o := configs["overlord"]
-		c := configs["channels"]
-
-		// Should add error checks and either default values
-		// or a `die` with a message what is needed.
-		nick = n.Pop().(string)
-		server = s.Pop().(string)
-		port = p.Pop().(string)
-		overlord = o.Pop().(string)
-		for {
-			ch, e := c.PopE()
+		mandatoryConf := func(s stack.Stack) string {
+			v, e := s.PopE()
 			if e != nil {
-				break
+				die("One of the mandatory configuration options not set.")
 			}
-			channelsToJoin = append(channelsToJoin, ch.(string))
+			return v.(string)
+		}
+		for k, v := range configs {
+			switch k {
+			case "nick":
+				nick = mandatoryConf(v)
+
+			case "server":
+				server = mandatoryConf(v)
+
+			case "port":
+				port = mandatoryConf(v)
+
+			case "overlord":
+				overlord = mandatoryConf(v)
+
+			case "commandPrefix":
+				cmdPrefix = mandatoryConf(v)
+
+			case "channels":
+				for {
+					ch, e := v.PopE()
+					if e != nil {
+						break
+					}
+					channelsToJoin = append(channelsToJoin, ch.(string))
+				}
+			}
 		}
 	}
 
@@ -229,7 +213,7 @@ func init() {
                 id INTEGER NOT NULL PRIMARY KEY,
                 url TEXT NOT NULL,
                 title TEXT,
-                time INTEGER, -- UNIX timestamp
+                timestamp INTEGER NOT NULL, -- UNIX timestamp
                 category TEXT,
                 FOREIGN KEY(category) REFERENCES categories(category)
             );
@@ -240,6 +224,7 @@ func init() {
             INSERT INTO categories VALUES('img');
             INSERT INTO categories VALUES('lulz');
             INSERT INTO categories VALUES('info');
+            INSERT INTO categories VALUES('blank'); -- for no category
         `); err != nil {
 			die("Failed to execute SQLite3.")
 		}
@@ -288,6 +273,9 @@ func main() {
 		writechan <- "JOIN " + c
 	}
 
+	// This is so that it's easy to give commands to the
+	// bot on the commandline while it's running, no need
+	// to do everything through IRC, saving bandwidth.
 	for {
 		input, err := in.ReadString('\n')
 		if err != nil {
